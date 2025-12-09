@@ -81,8 +81,8 @@ This tool is designed specifically for **private Codeforces contests** (group co
 1. **Clone the repository**
 
 ```bash
-git clone https://github.com/yourusername/acm-performance-tracker.git
-cd acm-performance-tracker
+git clone https://github.com/omarwael27/Codeforces-private-Contest-data-scraping.git
+cd Codeforces-private-Contest-data-scraping
 ```
 
 2. **Create virtual environment**
@@ -164,26 +164,26 @@ python main.py
 
 ## Project Structure
 
-```
-acm-performance-tracker/
-├── README.md                 # This file
-├── .env.example             # Environment template
-├── .gitignore               # Git ignore rules
-├── requirements.txt         # Python dependencies
-├── config.py                # Configuration settings
-├── main.py                  # Main entry point
+Codeforces-private-Contest-data-scraping/
+├── README.md # This file
+├── .env.example # Environment template
+├── .gitignore # Git ignore rules
+├── requirements.txt # Python dependencies
+├── config.py # Configuration settings
+├── main.py # Main entry point
 ├── scraper/
-│   ├── __init__.py
-│   ├── driver.py           # WebDriver management
-│   └── codeforces.py       # Codeforces scraper
+│ ├── **init**.py
+│ ├── driver.py # WebDriver management
+│ └── codeforces.py # Codeforces scraper
 ├── sheets/
-│   ├── __init__.py
-│   ├── auth.py             # Google Sheets authentication
-│   └── operations.py       # Sheet operations (CRUD)
+│ ├── **init**.py
+│ ├── auth.py # Google Sheets authentication
+│ └── operations.py # Sheet operations (CRUD)
 └── utils/
-    ├── __init__.py
-    └── logger.py           # Logging configuration
-```
+├── **init**.py
+└── logger.py # Logging configuration
+
+````
 
 ---
 
@@ -206,7 +206,7 @@ CONTESTS = [
     ("Contest1", "https://...", None),  # No individual threshold
     ("Contest2", "https://...", 5),     # Must solve 5+ problems
 ]
-```
+````
 
 ### Threshold Logic
 
@@ -295,7 +295,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Acknowledgments
 
 - Built for **acmASCIS Student Chapter** at Ain Shams University
-- Designed to automate Codeforces contest management
 - Saves countless hours on data aggregation
 
 ---
