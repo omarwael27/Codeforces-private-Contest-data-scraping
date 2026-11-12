@@ -1,5 +1,6 @@
 import time
 import random
+import re
 import pandas as pd
 from typing import List, Dict, Set, Tuple, Optional
 from selenium.webdriver.common.by import By
@@ -17,10 +18,31 @@ class CodeforcesScraperError(Exception):
     pass
 
 
+def clean_handle(raw_handle: str) -> Tuple[str, bool]:
+    """
+    Normalize a handle cell and detect unofficial/practice participants.
+
+    Codeforces renders practice-mode rows as "handle  →to practice" and
+    out-of-competition rows with a "*". Both should map to the bare handle,
+    with the row flagged as unofficial.
+
+    Returns:
+        (clean_handle, is_unofficial)
+    """
+    raw = (raw_handle or "").strip()
+    lowered = raw.lower()
+    is_unofficial = "*" in raw or "→" in raw or "to practice" in lowered
+
+    cleaned = raw.replace("*", "").strip()
+    cleaned = re.split(r"[\s→]+", cleaned)[0] if cleaned else ""
+    return cleaned, is_unofficial
+
+
 class CodeforcesScraper:
 
     def __init__(self):
         self.participants: Dict[str, Set[str]] = {}
+        self.unofficial: Set[str] = set()
 
     def extract_page_data(self, driver: DriverManager) -> List[Dict[str, any]]:
         """
@@ -53,7 +75,7 @@ class CodeforcesScraper:
                     if len(cells) < 5:
                         continue
 
-                    handle = cells[1].text.strip().replace("*", "").strip()
+                    handle, is_unofficial = clean_handle(cells[1].text)
                     if not handle:
                         continue
 
@@ -66,7 +88,13 @@ class CodeforcesScraper:
                             problem_letter = chr(65 + i - 4)
                             solved.append(problem_letter)
 
-                    data.append({"Handle": handle, "Solved": solved})
+                    data.append(
+                        {
+                            "Handle": handle,
+                            "Solved": solved,
+                            "Unofficial": is_unofficial,
+                        }
+                    )
 
                 except Exception as e:
                     logger.debug(f"Error parsing row: {e}")
@@ -78,46 +106,78 @@ class CodeforcesScraper:
             logger.error(f"Failed to extract page data: {e}")
             raise CodeforcesScraperError(f"Data extraction failed: {e}")
 
-    def scrape_page(self, url: str, page_num: int) -> Optional[List[Dict[str, any]]]:
+    def scrape_page(
+        self, url: str, page_num: int, driver: DriverManager
+    ) -> Optional[List[Dict[str, any]]]:
         """
         Scrape a single page of contest standings
 
         Args:
             url: Contest standings URL
             page_num: Page number to scrape
+            driver: Shared DriverManager instance
 
         Returns:
             List of participant data or None if failed
         """
-        with DriverManager() as driver:
-            try:
-                page_url = url if page_num == 1 else f"{url}/page/{page_num}"
+        try:
+            page_url = url if page_num == 1 else f"{url}/page/{page_num}"
 
-                logger.info(f"[PAGE {page_num}] Loading...")
-                driver.driver.get(page_url)
+            logger.info(f"[PAGE {page_num}] Loading...")
+            driver.driver.get(page_url)
 
-                time.sleep(random.uniform(config.MIN_PAGE_DELAY, config.MAX_PAGE_DELAY))
+            time.sleep(random.uniform(config.MIN_PAGE_DELAY, config.MAX_PAGE_DELAY))
 
-                driver.wait_for_cloudflare()
+            driver.wait_for_cloudflare()
 
-                driver.click_unofficial_checkbox()
-
-                if driver.check_access_denied():
-                    raise CodeforcesScraperError("Access denied by Cloudflare")
-
-                page_data = self.extract_page_data(driver)
-                logger.info(
-                    f"[PAGE {page_num}] Extracted {len(page_data)} participants"
+            page_source = driver.driver.page_source.lower()
+            if "standings are not available" in page_source:
+                if not driver.is_logged_in():
+                    raise CodeforcesScraperError(
+                        "Codeforces says 'Standings are not available' because "
+                        "the scraper is not logged in. Run `python login.py` "
+                        "once, then run `python main.py` again."
+                    )
+                raise CodeforcesScraperError(
+                    "Codeforces says 'Standings are not available'. Check that "
+                    "the contest link is correct and your account can view it."
                 )
 
-                return page_data
+            if "/enter" in driver.driver.current_url:
+                raise CodeforcesScraperError(
+                    "Codeforces login required. Run `python login.py` once, "
+                    "then run `python main.py` again."
+                )
 
-            except Exception as e:
-                logger.error(f"[PAGE {page_num}] Error: {e}")
-                return None
+            if config.INCLUDE_UNOFFICIAL:
+                driver.click_unofficial_checkbox()
+            else:
+                logger.info(
+                    "Skipping unofficial participants (INCLUDE_UNOFFICIAL=False)"
+                )
+
+            if driver.check_access_denied():
+                raise CodeforcesScraperError("Access denied by Cloudflare")
+
+            page_data = self.extract_page_data(driver)
+            logger.info(
+                f"[PAGE {page_num}] Extracted {len(page_data)} participants"
+            )
+
+            return page_data
+
+        except CodeforcesScraperError:
+            raise
+
+        except Exception as e:
+            logger.error(f"[PAGE {page_num}] Error: {e}")
+            return None
 
     def scrape_contest(
-        self, contest_name: str, contest_url: str
+        self,
+        contest_name: str,
+        contest_url: str,
+        driver: DriverManager,
     ) -> Tuple[pd.DataFrame, str]:
         """
         Scrape entire contest standings (all pages)
@@ -125,6 +185,7 @@ class CodeforcesScraper:
         Args:
             contest_name: Name of the contest
             contest_url: Contest standings URL
+            driver: Shared DriverManager instance
 
         Returns:
             Tuple of (DataFrame with results, CSV filename)
@@ -134,10 +195,11 @@ class CodeforcesScraper:
         logger.info("=" * 60)
 
         self.participants = {}
+        self.unofficial = set()
         page = 1
 
         while page <= config.MAX_PAGES:
-            page_data = self.scrape_page(contest_url, page)
+            page_data = self.scrape_page(contest_url, page, driver)
 
             if not page_data:
                 break
@@ -149,6 +211,9 @@ class CodeforcesScraper:
             for entry in page_data:
                 handle = entry["Handle"]
                 solved = set(entry["Solved"])
+
+                if entry.get("Unofficial"):
+                    self.unofficial.add(handle)
 
                 if handle in self.participants:
                     old_solved = self.participants[handle]
@@ -175,12 +240,20 @@ class CodeforcesScraper:
             time.sleep(random.uniform(config.MIN_PAGE_DELAY, config.MAX_PAGE_DELAY))
             page += 1
 
+        if not self.participants:
+            raise CodeforcesScraperError(
+                f"No standings data found for {contest_name}. "
+                "Make sure you are logged in (run `python login.py` once) and "
+                "that the contest link is correct."
+            )
+
         df = pd.DataFrame(
             [
                 {
                     "Handle": handle,
                     "Solved_Problems": ",".join(sorted(problems)),
                     "Total_Solved": len(problems),
+                    "Unofficial": handle in self.unofficial,
                 }
                 for handle, problems in self.participants.items()
             ]
@@ -191,7 +264,10 @@ class CodeforcesScraper:
         csv_file = f"{contest_name}_standings.csv"
         df.to_csv(csv_file, index=False, encoding="utf-8-sig")
 
-        logger.info(f"\n✅ Scraped {len(df)} participants")
+        logger.info(
+            f"\n✅ Scraped {len(df)} participants "
+            f"({len(self.unofficial)} unofficial/practice)"
+        )
         logger.info(f"✅ Saved to: {csv_file}\n")
 
         return df, csv_file
@@ -211,11 +287,11 @@ class CodeforcesScraper:
         results = {}
         scraper = CodeforcesScraper()
 
-        for contest_config in config.CONTESTS:
-            contest_name = contest_config[0]
-            contest_url = contest_config[1]
-
-            df, csv_file = scraper.scrape_contest(contest_name, contest_url)
-            results[contest_name] = (df, csv_file)
+        with DriverManager() as driver:
+            for contest_name, contest_url, _weight in config.CONTESTS:
+                df, csv_file = scraper.scrape_contest(
+                    contest_name, contest_url, driver
+                )
+                results[contest_name] = (df, csv_file)
 
         return results

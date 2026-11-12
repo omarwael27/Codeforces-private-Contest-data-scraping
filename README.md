@@ -2,7 +2,7 @@
 
 **Automated system for aggregating and managing Codeforces private contest results across multiple events**
 
-[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ---
@@ -28,7 +28,7 @@ This tool is designed specifically for **private Codeforces contests** (group co
 
 - Scrapes real-time standings from Codeforces
 - Aggregates performance across multiple contests
-- Automatically filters participants based on thresholds
+- Automatically marks participants `Yes`/`No` based on weighted thresholds
 - Updates Google Sheets with zero human intervention
 - Generates comprehensive analytics reports
 - Saves 4-5 hours per automation run
@@ -44,20 +44,24 @@ This tool is designed specifically for **private Codeforces contests** (group co
 - Bypasses Cloudflare protection using undetected-chromedriver
 - Handles pagination automatically
 - Extracts participant handles and solved problems
+- Includes unofficial/practice-mode participants (configurable)
 - Robust error handling and retry logic
 
-### 2. Multi-Contest Aggregation
+### 2. Multi-Contest Weighted Aggregation
 
-- Tracks performance across unlimited contests
-- Individual and global performance thresholds
+- Tracks performance across any number of contests
+- Per-contest weight: solving `m` problems is worth `m * weight`
+- Weighted score compared against a threshold per sheet/day
 - Comprehensive scoring system
 
 ### 3. Google Sheets Integration
 
 - OAuth 2.0 authentication
-- Automatic row deletion based on thresholds
+- Accepts a full Google Sheet link (or bare spreadsheet ID)
+- Writes `Yes`/`No` in column D based on the weighted score
+- Never deletes participant rows
 - Professional cell formatting
-- Multi-sheet support
+- Multi-sheet support with per-day thresholds
 
 ### 4. Analytics & Reporting
 
@@ -72,7 +76,7 @@ This tool is designed specifically for **private Codeforces contests** (group co
 
 ### Prerequisites
 
-- Python 3.13+
+- Python 3.11+
 - Google Cloud Project with Sheets API enabled
 - Chrome/Chromium browser
 
@@ -112,30 +116,46 @@ Create a `.env` file in the project root with the following variables:
 
 ```env
 # Google Sheets Configuration
-SPREADSHEET_ID=your_google_sheets_id_here
-SHEET_NAMES=Sheet1,Sheet2,Sheet3
+GOOGLE_SHEET_LINK=https://docs.google.com/spreadsheets/d/your_spreadsheet_id/edit
+SHEET_NAMES=Sat 4 -> 8,Sun 10 -> 2,Sun 4 -> 8,Mon 4 -> 8
 TOKEN_FILE=token.pickle
 CREDENTIALS_FILE=credentials.json
 
-# Performance Thresholds
+# Performance Thresholds (per sheet/day)
+SHEET_THRESHOLDS=Sat 4 -> 8=8;Sun 10 -> 2=10;Sun 4 -> 8=8;Mon 4 -> 8=8
 GLOBAL_THRESHOLD=8
+
+# Contests: name|standings_url|weight
+CONTEST_COUNT=2
+CONTESTS=Contest1|https://.../standings|1;Contest2|https://.../standings|2
 
 # Scraper Settings
 RUN_SCRAPER=True
+INCLUDE_UNOFFICIAL=True
+CHROME_PROFILE_DIR=chrome_profile
+LOGIN_TIMEOUT=300
 
 # Output Files
 COMBINED_CSV=combined_results.csv
 ```
 
-6. **Configure contests** (in `config.py`)
+6. **Configure contests** (in `.env`)
 
-```python
-CONTESTS = [
-    # (name, url, individual_threshold)
-    ("Contest1", "https://...", None),  # No individual threshold
-    ("Contest2", "https://...", 5),     # Must solve 5+ problems
-]
+```env
+# Solving m problems in a contest gives m * weight points.
+CONTESTS=Contest1|https://.../standings|1;Contest2|https://.../standings|2
 ```
+
+7. **Log in to Codeforces once**
+
+Private group standings require a logged-in group member. Run:
+
+```bash
+python login.py
+```
+
+Log in in the opened browser. The session is saved in `chrome_profile/`, so
+later runs can access the standings.
 
 ---
 
@@ -150,6 +170,8 @@ Codeforces-private-Contest-data-scraping/
 ├── requirements.txt
 ├── config.py
 ├── main.py
+├── login.py
+├── chrome_profile/
 ├── Contest1_standings.csv
 ├── Contest2_standings.csv
 ├── combined_results.csv
@@ -190,17 +212,17 @@ The system operates in three main phases:
 
 **Scraping Phase**: Retrieves standings from all configured Codeforces contests
 
-**Filtering Phase**: Removes participants below performance thresholds
+**Scoring Phase**: Multiplies each contest's solved count by its weight, then sums the weighted scores
 
-**Google Sheets Update**: Automatically updates spreadsheets with filtered data
+**Google Sheets Update**: Writes `Yes`/`No` in column D for each participant and each sheet/day threshold
 
-**Report Generation**: Creates combined analytics CSV with aggregate results
+**Report Generation**: Creates combined analytics CSV with weighted aggregate results
 
 ### Output Files
 
 - `Contest1_standings.csv` - Individual contest results
 - `Contest2_standings.csv` - Individual contest results
-- `combined_results.csv` - Aggregated results across all contests
+- `combined_results.csv` - Aggregated results with per-contest weighted scores and weighted totals
 - `acm_tracker.log` - Detailed execution log
 
 ---
@@ -209,29 +231,41 @@ The system operates in three main phases:
 
 ### Environment Variables (`.env`)
 
-| Variable           | Description                            | Default  |
-| ------------------ | -------------------------------------- | -------- |
-| `SPREADSHEET_ID`   | Google Sheets ID                       | Required |
-| `GLOBAL_THRESHOLD` | Minimum total problems across contests | 8        |
-| `SHEET_NAMES`      | Comma-separated sheet names            | Required |
-| `RUN_SCRAPER`      | Run scraper or load existing CSVs      | True     |
+| Variable            | Description                                                       | Default  |
+| ------------------- | ----------------------------------------------------------------- | -------- |
+| `GOOGLE_SHEET_LINK` | Full Google Sheet link (or use `SPREADSHEET_ID`)                  | Required |
+| `SPREADSHEET_ID`    | Bare Google Sheets ID (alternative to `GOOGLE_SHEET_LINK`)        | -        |
+| `SHEET_NAMES`       | Comma-separated sheet/tab names                                   | Required |
+| `SHEET_THRESHOLDS`  | Semicolon-separated `sheet=threshold` pairs                       | -        |
+| `GLOBAL_THRESHOLD`  | Fallback threshold for sheets without their own value             | 8        |
+| `CONTEST_COUNT`     | Number of contests (must match the `CONTESTS` entries)            | -        |
+| `CONTESTS`          | Semicolon-separated `name\|standings_url\|weight` entries         | -        |
+| `RUN_SCRAPER`       | Run scraper or load existing CSVs                                 | True     |
+| `INCLUDE_UNOFFICIAL`| Count unofficial/practice-mode participants                       | True     |
+| `CHROME_VERSION`    | Force ChromeDriver major version (auto-detected if unset)         | -        |
+| `CHROME_PROFILE_DIR`| Chrome profile folder that keeps the Codeforces login              | `chrome_profile` |
+| `LOGIN_TIMEOUT`     | Seconds `login.py` waits for manual login                         | 300      |
 
-### Contest Configuration (`config.py`)
+### Contest Configuration (`.env`)
 
-```python
-CONTESTS = [
-    # (name, url, individual_threshold)
-    ("Contest1", "https://...", None),  # No individual threshold
-    ("Contest2", "https://...", 5),     # Must solve 5+ problems
-]
+```env
+# name|standings_url|weight
+CONTESTS=Contest1|https://.../standings|1;Contest2|https://.../standings|2
 ```
+
+If `CONTESTS` is not set, the values in `config.py` are used.
 
 ### Threshold Logic
 
-A participant is removed if:
+The weighted score for a participant is:
 
-- They fail to meet any individual contest threshold (if set), OR
-- Their total across all contests is less than GLOBAL_THRESHOLD
+```
+score = sum(solved_in_contest_i * weight_i)
+```
+
+A participant is valid to a given sheet/day when `score >= threshold` for that
+sheet. The app writes `Yes` in column D when valid and `No` otherwise. Rows are
+never deleted, and each sheet can have a different threshold.
 
 ---
 
@@ -271,13 +305,18 @@ Solution: The scraper waits 15 seconds for Cloudflare challenges. If persistent,
 
 Solution: Download OAuth credentials from Google Cloud Console.
 
-**3. "SPREADSHEET_ID not set"**
+**3. "GOOGLE_SHEET_LINK not set"**
 
-Solution: Add your Google Sheets ID to `.env` file.
+Solution: Add your Google Sheet link to the `.env` file.
 
 **4. Rate limiting**
 
 Solution: Random delays are built in; adjust delays in `config.py`.
+
+**5. "Standings are not available"**
+
+Solution: Private group standings require a logged-in group member. Run
+`python login.py`, log in in the opened browser, then run `python main.py`.
 
 ---
 
@@ -318,7 +357,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Tech Stack
 
-- Python 3.13 - Core language
+- Python 3.11+ - Core language
 - Selenium + undetected-chromedriver - Web scraping
 - pandas - Data processing
 - Google Sheets API - Spreadsheet automation

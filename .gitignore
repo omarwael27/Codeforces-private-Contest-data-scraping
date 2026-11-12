@@ -27,6 +27,7 @@ wheels/
 
 # Virtual Environment
 venv/
+.venv/
 ENV/
 env/
 
@@ -40,6 +41,9 @@ env/
 # Output files
 *.csv
 *.log
+
+# Scraper Chrome profile (contains login cookies)
+chrome_profile/
 
 # OS
 .DS_Store

@@ -1,10 +1,74 @@
+import re
 import time
 import pandas as pd
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 from sheets.auth import SheetsAuthenticator
 from utils.logger import logger
 import config
+
+
+def _a1_quote(sheet_name: str) -> str:
+    """Quote a sheet name for use in A1 notation."""
+    return "'" + sheet_name.replace("'", "''") + "'"
+
+
+def _normalize_sheet_name(name: str) -> str:
+    """
+    Normalize a sheet name so spacing/arrow differences don't matter.
+
+    For example "Sat 4->8", "Sat 4 -> 8" and "sat 4 → 8" all normalize to
+    the same value.
+    """
+    name = (name or "").replace("→", "->").replace("–", "-").replace("—", "-")
+    return re.sub(r"\s+", "", name).casefold()
+
+
+def compute_weighted_score(
+    handle: str,
+    contest_configs: List[Tuple[str, str, float]],
+    dfs: Dict[str, pd.DataFrame],
+) -> Tuple[float, Dict]:
+    """
+    Compute the weighted score for a handle across all contests.
+
+    Solving one problem in a contest is worth that contest's weight, so
+    solving m problems is worth m * weight.
+    """
+    handle = (handle or "").strip()
+    total_score = 0.0
+    details = {}
+
+    for contest_name, _url, weight in contest_configs:
+        df = dfs[contest_name]
+        match = df[df["Handle"] == handle]
+
+        solved = int(match.iloc[0]["Total_Solved"]) if not match.empty else 0
+        weighted = solved * weight
+        total_score += weighted
+
+        details[contest_name] = {
+            "solved": solved,
+            "weight": weight,
+            "weighted": weighted,
+        }
+
+    return total_score, details
+
+
+def build_weighted_scores(
+    contest_configs: List[Tuple[str, str, float]],
+    dfs: Dict[str, pd.DataFrame],
+) -> Dict[str, float]:
+    """Precompute weighted scores for every handle across all contests."""
+    scores: Dict[str, float] = {}
+
+    for contest_name, _url, weight in contest_configs:
+        df = dfs[contest_name]
+        for handle, solved in zip(df["Handle"], df["Total_Solved"]):
+            scores[handle] = scores.get(handle, 0.0) + int(solved) * weight
+
+    return scores
 
 
 class SheetsOperations:
@@ -13,17 +77,20 @@ class SheetsOperations:
         self.auth = SheetsAuthenticator()
         self.service = None
         self.sheet_ids: Dict[str, int] = {}
+        self.sheet_properties: Dict[str, Dict] = {}
+        self.resolved_names: Dict[str, str] = {}
 
     def initialize(self):
         self.service = self.auth.authenticate()
-        self.sheet_ids = self._get_sheet_ids()
+        self._load_sheet_metadata()
 
-    def _get_sheet_ids(self) -> Dict[str, int]:
+    def _load_sheet_metadata(self) -> None:
         """
-        Get sheet IDs for all configured sheets
+        Load sheet metadata and resolve configured names to actual tab titles.
 
-        Returns:
-            Dictionary mapping sheet name to sheet ID
+        The names in .env may differ from the real tab titles only by spacing
+        around an arrow (e.g. "Sat 4->8" vs "Sat 4 -> 8"), so match on a
+        normalized form instead of requiring an exact string.
         """
         metadata = (
             self.service.spreadsheets()
@@ -31,13 +98,102 @@ class SheetsOperations:
             .execute()
         )
 
-        sheet_ids = {}
+        titles: Dict[str, Dict] = {}
+        by_normalized: Dict[str, str] = {}
         for sheet in metadata["sheets"]:
-            title = sheet["properties"]["title"]
-            if title in config.SHEET_NAMES:
-                sheet_ids[title] = sheet["properties"]["sheetId"]
+            properties = sheet["properties"]
+            title = properties["title"]
+            titles[title] = properties
+            by_normalized[_normalize_sheet_name(title)] = title
 
-        return sheet_ids
+        resolved = {}
+        for name in config.SHEET_NAMES:
+            actual = name if name in titles else by_normalized.get(
+                _normalize_sheet_name(name)
+            )
+            if actual:
+                resolved[name] = actual
+                if actual != name:
+                    logger.info(f"  🔗 Sheet '{name}' matched to '{actual}'")
+            else:
+                logger.error(
+                    f"Sheet '{name}' not found. Available tabs: "
+                    f"{', '.join(titles)}"
+                )
+
+        self.resolved_names = resolved
+        self.sheet_ids = {
+            actual: titles[actual]["sheetId"] for actual in resolved.values()
+        }
+        self.sheet_properties = {
+            actual: titles[actual] for actual in resolved.values()
+        }
+
+    def resolve_sheet_name(self, sheet_name: str) -> Optional[str]:
+        """Return the real tab title for a configured sheet name."""
+        return self.resolved_names.get(sheet_name)
+
+    def ensure_capacity(
+        self, sheet_name: str, min_columns: int = 4, min_rows: int = 0
+    ) -> None:
+        """
+        Grow a sheet's grid so it has at least the requested columns/rows.
+
+        Google Sheets rejects writes to ranges outside the current grid (for
+        example writing column D on a sheet that only has A:C).
+        """
+        actual = self.resolve_sheet_name(sheet_name)
+        if actual is None:
+            return
+
+        sheet_id = self.sheet_ids.get(actual)
+        if sheet_id is None:
+            return
+
+        properties = self.sheet_properties.get(actual, {})
+        grid = properties.get("gridProperties", {})
+        current_columns = int(grid.get("columnCount", 0))
+        current_rows = int(grid.get("rowCount", 0))
+
+        requests = []
+        if current_columns < min_columns:
+            requests.append(
+                {
+                    "appendDimension": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "length": min_columns - current_columns,
+                    }
+                }
+            )
+        if min_rows and current_rows < min_rows:
+            requests.append(
+                {
+                    "appendDimension": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "length": min_rows - current_rows,
+                    }
+                }
+            )
+
+        if not requests:
+            return
+
+        self.service.spreadsheets().batchUpdate(
+            spreadsheetId=config.SPREADSHEET_ID, body={"requests": requests}
+        ).execute()
+
+        grid["columnCount"] = max(current_columns, min_columns)
+        if min_rows:
+            grid["rowCount"] = max(current_rows, min_rows)
+        properties["gridProperties"] = grid
+        self.sheet_properties[actual] = properties
+
+        logger.info(
+            f"  ✅ Expanded '{actual}' to "
+            f"{grid['columnCount']} columns x {grid.get('rowCount', current_rows)} rows"
+        )
 
     def get_sheet_data(self, sheet_name: str) -> List[List[str]]:
         """
@@ -49,54 +205,38 @@ class SheetsOperations:
         Returns:
             2D list of cell values
         """
+        actual = self.resolve_sheet_name(sheet_name) or sheet_name
         result = (
             self.service.spreadsheets()
             .values()
-            .get(spreadsheetId=config.SPREADSHEET_ID, range=f"{sheet_name}!A:D")
+            .get(
+                spreadsheetId=config.SPREADSHEET_ID,
+                range=f"{_a1_quote(actual)}!A:D",
+            )
             .execute()
         )
         return result.get("values", [])
 
-    def delete_rows(self, sheet_name: str, rows_to_delete: List[int]) -> None:
+    def update_cells(self, updates: List[Dict]) -> None:
         """
-        Delete specified rows from sheet
+        Write values to cells in bulk.
 
         Args:
-            sheet_name: Name of the sheet
-            rows_to_delete: List of 0-indexed row numbers to delete
+            updates: List of {"range": A1 range, "values": [[value]]} entries
         """
-        if not rows_to_delete:
+        if not updates:
             return
 
-        sheet_id = self.sheet_ids.get(sheet_name)
-        if sheet_id is None:
-            logger.error(f"Sheet '{sheet_name}' not found")
-            return
-
-        rows_to_delete = sorted(set(rows_to_delete), reverse=True)
-
-        requests = []
-        for row_index in rows_to_delete:
-            requests.append(
-                {
-                    "deleteDimension": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "ROWS",
-                            "startIndex": row_index,
-                            "endIndex": row_index + 1,
-                        }
-                    }
-                }
-            )
-
-        body = {"requests": requests}
-        self.service.spreadsheets().batchUpdate(
-            spreadsheetId=config.SPREADSHEET_ID, body=body
-        ).execute()
-
-        # Only log from the caller with sheet name context
-        time.sleep(2)
+        for i in range(0, len(updates), 500):
+            batch = updates[i : i + 500]
+            body = {
+                "valueInputOption": "RAW",
+                "data": batch,
+            }
+            self.service.spreadsheets().values().batchUpdate(
+                spreadsheetId=config.SPREADSHEET_ID, body=body
+            ).execute()
+            time.sleep(1)
 
     def format_columns(self, sheet_name: str) -> None:
         """
@@ -105,7 +245,8 @@ class SheetsOperations:
         Args:
             sheet_name: Name of the sheet
         """
-        sheet_id = self.sheet_ids.get(sheet_name)
+        actual = self.resolve_sheet_name(sheet_name) or sheet_name
+        sheet_id = self.sheet_ids.get(actual)
         if sheet_id is None:
             logger.error(f"Sheet '{sheet_name}' not found")
             return
@@ -113,7 +254,10 @@ class SheetsOperations:
         result = (
             self.service.spreadsheets()
             .values()
-            .get(spreadsheetId=config.SPREADSHEET_ID, range=f"{sheet_name}!B:C")
+            .get(
+                spreadsheetId=config.SPREADSHEET_ID,
+                range=f"{_a1_quote(actual)}!B:C",
+            )
             .execute()
         )
         values = result.get("values", [])
@@ -202,80 +346,16 @@ class SheetsOperations:
             logger.info(f"  ✅ Formatted {len(requests)} cells")
 
 
-def should_delete_row(
-    handle: str,
-    contest_configs: List[Tuple[str, str, Optional[int]]],
-    dfs: Dict[str, pd.DataFrame],
-    global_threshold: int,
-) -> Tuple[bool, Dict]:
-    """
-    Determine if a row should be deleted based on performance thresholds
-
-    Args:
-        handle: Participant handle
-        contest_configs: List of contest configurations
-        dfs: Dictionary mapping contest name to DataFrame
-        global_threshold: Minimum total problems across all contests
-
-    Returns:
-        Tuple of (should_delete: bool, details: dict)
-    """
-    if not handle or not handle.strip():
-        return True, {"error": "Empty handle"}
-
-    handle = handle.strip()
-    details = {}
-    total_across_contests = 0
-    failed_thresholds = []
-
-    for contest_config in contest_configs:
-        contest_name = contest_config[0]
-        contest_threshold = contest_config[2] if len(contest_config) > 2 else None
-
-        df = dfs[contest_name]
-
-        if handle in df["Handle"].values:
-            total_solved = df[df["Handle"] == handle].iloc[0]["Total_Solved"]
-        else:
-            total_solved = 0
-
-        total_across_contests += total_solved
-
-        meets_threshold = True
-        if contest_threshold is not None:
-            meets_threshold = total_solved >= contest_threshold
-            if not meets_threshold:
-                failed_thresholds.append(
-                    (contest_name, total_solved, contest_threshold)
-                )
-
-        details[contest_name] = {
-            "total_solved": total_solved,
-            "threshold": contest_threshold,
-            "meets_threshold": meets_threshold,
-        }
-
-    details["total_all_contests"] = total_across_contests
-    details["failed_thresholds"] = failed_thresholds
-
-    # Delete if failed any threshold OR total below global threshold
-    should_delete = (len(failed_thresholds) > 0) or (
-        total_across_contests < global_threshold
-    )
-
-    return should_delete, details
-
-
 def clean_google_sheets(dfs: Dict[str, pd.DataFrame]) -> None:
     """
-    Clean Google Sheets by deleting rows below thresholds
+    Mark participants as eligible or not in column D of every configured sheet.
 
-    Args:
-        dfs: Dictionary mapping contest name to DataFrame
+    A participant is valid for a sheet when their weighted score across all
+    contests is greater than or equal to that sheet's threshold. Rows are
+    never deleted.
     """
     logger.info("\n" + "=" * 60)
-    logger.info("STEP 2: CLEANING GOOGLE SHEETS")
-    logger.info(f"Global Threshold: {config.GLOBAL_THRESHOLD}")
+    logger.info("STEP 2: MARKING PARTICIPANTS IN GOOGLE SHEETS")
     logger.info("=" * 60)
 
     sheets = SheetsOperations()
@@ -283,46 +363,68 @@ def clean_google_sheets(dfs: Dict[str, pd.DataFrame]) -> None:
 
     logger.info("✅ Authenticated\n")
 
-    total_deleted = 0
+    scores = build_weighted_scores(config.CONTESTS, dfs)
+    total_marked = 0
 
-    # Process each sheet
+    # Data starts at row 3 (index 2): row 1 is the header, row 2 is a section row.
     for sheet_name in config.SHEET_NAMES:
+        threshold = config.get_sheet_threshold(sheet_name)
+        actual_name = sheets.resolve_sheet_name(sheet_name)
+
         logger.info("\n" + "=" * 60)
-        logger.info(f"Processing Sheet: '{sheet_name}'")
+        logger.info(f"Processing Sheet: '{sheet_name}' (threshold: {threshold})")
         logger.info("=" * 60)
+
+        if actual_name is None:
+            logger.error("  ⚠️  Skipping: sheet not found in spreadsheet")
+            continue
+
+        sheets.ensure_capacity(sheet_name, min_columns=4)
 
         data = sheets.get_sheet_data(sheet_name)
 
-        if not data or len(data) < 4:
+        if not data or len(data) < 3:
             logger.warning("  ⚠️  No data rows")
             continue
 
-        rows_to_delete = []
+        updates = []
+        valid_count = 0
+        invalid_count = 0
 
-        # Check each row (skip first 3 header rows)
-        for row_idx in range(3, len(data)):
+        for row_idx in range(2, len(data)):
             row = data[row_idx]
-
-            handle = row[2].strip() if len(row) > 2 else None
+            handle = row[2].strip() if len(row) > 2 else ""
 
             if not handle:
                 continue
 
-            should_delete, details = should_delete_row(
-                handle, config.CONTESTS, dfs, config.GLOBAL_THRESHOLD
+            score = scores.get(handle, 0.0)
+            is_valid = score >= threshold
+            status = "Yes" if is_valid else "No"
+
+            if is_valid:
+                valid_count += 1
+            else:
+                invalid_count += 1
+
+            updates.append(
+                {
+                    "range": f"{_a1_quote(actual_name)}!D{row_idx + 1}",
+                    "values": [[status]],
+                }
             )
 
-            if should_delete:
-                rows_to_delete.append(row_idx)
-
-        if rows_to_delete:
-            sheets.delete_rows(sheet_name, rows_to_delete)
-            total_deleted += len(rows_to_delete)
-            logger.info(f"  ✅ Deleted {len(rows_to_delete)} rows from '{sheet_name}'")
+        if updates:
+            sheets.update_cells(updates)
+            total_marked += len(updates)
+            logger.info(
+                f"  ✅ Marked {len(updates)} rows "
+                f"(Yes: {valid_count}, No: {invalid_count})"
+            )
         else:
-            logger.info(f"  ✅ No rows to delete in '{sheet_name}'")
+            logger.info("  ✅ No rows to mark")
 
-    logger.info(f"\n✅ Total deleted: {total_deleted} rows\n")
+    logger.info(f"\n✅ Total marked: {total_marked} rows\n")
 
     logger.info("=" * 60)
     logger.info("STEP 3: FORMATTING COLUMNS")
