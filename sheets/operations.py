@@ -4,6 +4,7 @@ import pandas as pd
 from typing import Dict, List, Optional, Tuple
 
 from sheets.auth import SheetsAuthenticator
+from utils.handles import handle_key, live_mask
 from utils.logger import logger
 import config
 
@@ -26,47 +27,67 @@ def _normalize_sheet_name(name: str) -> str:
 
 def compute_weighted_score(
     handle: str,
-    contest_configs: List[Tuple[str, str, float]],
+    contest_configs: List[Tuple[str, str, float, float]],
     dfs: Dict[str, pd.DataFrame],
 ) -> Tuple[float, Dict]:
     """
     Compute the weighted score for a handle across all contests.
 
     Solving one problem in a contest is worth that contest's weight, so
-    solving m problems is worth m * weight.
+    solving m problems is worth m * weight. Live participants also receive
+    that contest's participation bonus.
     """
-    handle = (handle or "").strip()
+    key = handle_key(handle)
     total_score = 0.0
     details = {}
 
-    for contest_name, _url, weight in contest_configs:
+    for contest_name, _url, weight, bonus in contest_configs:
         df = dfs[contest_name]
-        match = df[df["Handle"] == handle]
+        match = df[df["Handle"].map(handle_key) == key]
 
         solved = int(match.iloc[0]["Total_Solved"]) if not match.empty else 0
+        is_live = bool(live_mask(match).iloc[0]) if not match.empty else False
         weighted = solved * weight
-        total_score += weighted
+        applied_bonus = bonus if (bonus and is_live) else 0.0
+        total_score += weighted + applied_bonus
 
         details[contest_name] = {
             "solved": solved,
             "weight": weight,
             "weighted": weighted,
+            "live": is_live,
+            "bonus": applied_bonus,
         }
 
     return total_score, details
 
 
 def build_weighted_scores(
-    contest_configs: List[Tuple[str, str, float]],
+    contest_configs: List[Tuple[str, str, float, float]],
     dfs: Dict[str, pd.DataFrame],
 ) -> Dict[str, float]:
-    """Precompute weighted scores for every handle across all contests."""
+    """
+    Precompute weighted scores for every handle across all contests.
+
+    Keys are case-insensitive cleaned handles so sheets can use different
+    casing from Codeforces.
+    """
     scores: Dict[str, float] = {}
 
-    for contest_name, _url, weight in contest_configs:
+    for contest_name, _url, weight, bonus in contest_configs:
         df = dfs[contest_name]
-        for handle, solved in zip(df["Handle"], df["Total_Solved"]):
-            scores[handle] = scores.get(handle, 0.0) + int(solved) * weight
+        live = live_mask(df)
+
+        for handle, solved, is_live in zip(
+            df["Handle"], df["Total_Solved"], live
+        ):
+            key = handle_key(handle)
+            if not key:
+                continue
+
+            scores[key] = scores.get(key, 0.0) + int(solved) * weight
+            if bonus and bool(is_live):
+                scores[key] += bonus
 
     return scores
 
@@ -134,7 +155,7 @@ class SheetsOperations:
         return self.resolved_names.get(sheet_name)
 
     def ensure_capacity(
-        self, sheet_name: str, min_columns: int = 4, min_rows: int = 0
+        self, sheet_name: str, min_columns: int = 5, min_rows: int = 0
     ) -> None:
         """
         Grow a sheet's grid so it has at least the requested columns/rows.
@@ -211,7 +232,7 @@ class SheetsOperations:
             .values()
             .get(
                 spreadsheetId=config.SPREADSHEET_ID,
-                range=f"{_a1_quote(actual)}!A:D",
+                range=f"{_a1_quote(actual)}!A:E",
             )
             .execute()
         )
@@ -240,7 +261,8 @@ class SheetsOperations:
 
     def format_columns(self, sheet_name: str) -> None:
         """
-        Format columns B and C with borders and left alignment
+        Format columns B:E with borders. Names are left aligned and the
+        verdict/score columns are centered.
 
         Args:
             sheet_name: Name of the sheet
@@ -256,7 +278,7 @@ class SheetsOperations:
             .values()
             .get(
                 spreadsheetId=config.SPREADSHEET_ID,
-                range=f"{_a1_quote(actual)}!B:C",
+                range=f"{_a1_quote(actual)}!B:E",
             )
             .execute()
         )
@@ -268,11 +290,13 @@ class SheetsOperations:
         requests = []
 
         for row_idx, row in enumerate(values):
-            for col_idx in range(min(2, len(row))):
+            for col_idx in range(min(4, len(row))):
                 cell_value = row[col_idx].strip() if col_idx < len(row) else ""
 
                 if not cell_value:
                     continue
+
+                alignment = "LEFT" if col_idx < 2 else "CENTER"
 
                 requests.append(
                     {
@@ -290,7 +314,7 @@ class SheetsOperations:
                                     "values": [
                                         {
                                             "userEnteredFormat": {
-                                                "horizontalAlignment": "LEFT",
+                                                "horizontalAlignment": alignment,
                                                 "borders": {
                                                     "left": {
                                                         "style": "SOLID",
@@ -348,7 +372,7 @@ class SheetsOperations:
 
 def clean_google_sheets(dfs: Dict[str, pd.DataFrame]) -> None:
     """
-    Mark participants as eligible or not in column D of every configured sheet.
+    Mark participants in columns D (verdict) and E (score) of every sheet.
 
     A participant is valid for a sheet when their weighted score across all
     contests is greater than or equal to that sheet's threshold. Rows are
@@ -379,7 +403,7 @@ def clean_google_sheets(dfs: Dict[str, pd.DataFrame]) -> None:
             logger.error("  ⚠️  Skipping: sheet not found in spreadsheet")
             continue
 
-        sheets.ensure_capacity(sheet_name, min_columns=4)
+        sheets.ensure_capacity(sheet_name, min_columns=5)
 
         data = sheets.get_sheet_data(sheet_name)
 
@@ -387,20 +411,36 @@ def clean_google_sheets(dfs: Dict[str, pd.DataFrame]) -> None:
             logger.warning("  ⚠️  No data rows")
             continue
 
+        header_updates = []
         updates = []
         valid_count = 0
         invalid_count = 0
 
+        if len(data[0]) < 5 or not str(data[0][4]).strip():
+            header_updates.append(
+                {
+                    "range": f"{_a1_quote(actual_name)}!E1",
+                    "values": [["Score"]],
+                }
+            )
+
         for row_idx in range(2, len(data)):
             row = data[row_idx]
-            handle = row[2].strip() if len(row) > 2 else ""
+            raw_handle = row[2].strip() if len(row) > 2 else ""
 
-            if not handle:
+            if not raw_handle:
                 continue
 
-            score = scores.get(handle, 0.0)
+            key = handle_key(raw_handle)
+            if not key:
+                continue
+
+            score = scores.get(key, 0.0)
             is_valid = score >= threshold
             status = "Yes" if is_valid else "No"
+            score_value = (
+                int(score) if float(score).is_integer() else round(float(score), 2)
+            )
 
             if is_valid:
                 valid_count += 1
@@ -409,13 +449,16 @@ def clean_google_sheets(dfs: Dict[str, pd.DataFrame]) -> None:
 
             updates.append(
                 {
-                    "range": f"{_a1_quote(actual_name)}!D{row_idx + 1}",
-                    "values": [[status]],
+                    "range": (
+                        f"{_a1_quote(actual_name)}!"
+                        f"D{row_idx + 1}:E{row_idx + 1}"
+                    ),
+                    "values": [[status, score_value]],
                 }
             )
 
-        if updates:
-            sheets.update_cells(updates)
+        if header_updates or updates:
+            sheets.update_cells(header_updates + updates)
             total_marked += len(updates)
             logger.info(
                 f"  ✅ Marked {len(updates)} rows "

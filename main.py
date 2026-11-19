@@ -3,44 +3,55 @@ import sys
 import pandas as pd
 from typing import Dict, Tuple
 import config
-from scraper.codeforces import CodeforcesScraper, clean_handle
+from scraper.codeforces import CodeforcesScraper
 from sheets.operations import clean_google_sheets
+from utils.handles import as_bool_series, handle_key, live_mask, parse_handle
 from utils.logger import logger
 
 
 def normalize_handles(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Clean legacy CSV handles such as "Name  →to practice" and flag them.
-
-    Older scraped CSVs stored the practice marker inside the Handle column,
-    which prevented those handles from matching the Google Sheet.
+    Clean legacy CSV handles such as "Name  →to practice", virtual markers,
+    and appended virtual times, then deduplicate case-insensitively.
     """
     if "Handle" not in df.columns:
         return df
 
     df = df.copy()
-    parsed = df["Handle"].fillna("").map(clean_handle)
-    df["Handle"] = [handle for handle, _ in parsed]
-    flagged = pd.Series(
-        [is_unofficial for _, is_unofficial in parsed], index=df.index
+    parsed = df["Handle"].fillna("").map(parse_handle)
+    df["Handle"] = [info.handle for info in parsed]
+    flagged_unofficial = pd.Series(
+        [info.unofficial for info in parsed], index=df.index
     )
+    flagged_live = pd.Series([info.live for info in parsed], index=df.index)
 
     if "Unofficial" in df.columns:
-        df["Unofficial"] = df["Unofficial"].astype(bool) | flagged
+        df["Unofficial"] = (
+            as_bool_series(df["Unofficial"]) | flagged_unofficial
+        )
     else:
-        df["Unofficial"] = flagged
+        df["Unofficial"] = flagged_unofficial
+
+    if "Live" in df.columns:
+        # An explicit Live column is authoritative. Markers can only
+        # downgrade a row (virtual/practice), never upgrade a cleaned handle.
+        df["Live"] = as_bool_series(df["Live"]) & flagged_live
+    else:
+        df["Live"] = flagged_live
 
     df = df[df["Handle"] != ""]
 
-    if df["Handle"].duplicated().any():
-        unofficial_map = df.groupby("Handle")["Unofficial"].any()
+    if df["Handle"].str.casefold().duplicated().any():
+        df["_key"] = df["Handle"].str.casefold()
+        merged = df.groupby("_key")[["Unofficial", "Live"]].any()
         df = (
             df.sort_values("Total_Solved", ascending=False)
-            .drop_duplicates(subset="Handle", keep="first")
-            .set_index("Handle")
+            .drop_duplicates(subset="_key", keep="first")
+            .set_index("_key")
         )
-        df["Unofficial"] = unofficial_map
-        df = df.reset_index()
+        df["Unofficial"] = merged["Unofficial"]
+        df["Live"] = merged["Live"]
+        df = df.reset_index(drop=True)
 
     return df.reset_index(drop=True)
 
@@ -77,18 +88,23 @@ def weighted_score(handle: str, dfs: Dict[str, pd.DataFrame]) -> Tuple[float, in
     Compute the weighted score for a handle across all contests.
 
     Solving one problem in a contest is worth that contest's weight, so
-    solving m problems is worth m * weight.
+    solving m problems is worth m * weight. Live participants also receive
+    each contest's participation bonus.
     """
+    key = handle_key(handle)
     total_score = 0.0
     total_solved = 0
 
-    for contest_name, _url, weight in config.CONTESTS:
+    for contest_name, _url, weight, bonus in config.CONTESTS:
         df = dfs[contest_name]
-        match = df[df["Handle"] == handle]
+        match = df[df["Handle"].map(handle_key) == key]
 
         solved = int(match.iloc[0]["Total_Solved"]) if not match.empty else 0
+        is_live = bool(live_mask(match).iloc[0]) if not match.empty else False
         total_solved += solved
         total_score += solved * weight
+        if bonus and is_live:
+            total_score += bonus
 
     return total_score, total_solved
 
@@ -107,42 +123,59 @@ def generate_combined_csv(dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     logger.info("STEP 4: GENERATING COMBINED RESULTS")
     logger.info("=" * 60)
 
-    # Collect all unique handles
-    all_handles = set()
-    unofficial_handles = set()
-    for df in dfs.values():
-        all_handles.update(df["Handle"].tolist())
+    # Collect all unique handles, keyed case-insensitively.
+    display_handles = {}
+    unofficial_keys = set()
+    contest_rows = {}
 
-        if "Unofficial" in df.columns:
-            mask = (
-                df["Unofficial"]
-                .astype(str)
-                .str.lower()
-                .isin(["true", "1", "yes"])
-            )
-            unofficial_handles.update(df.loc[mask, "Handle"])
+    for contest_name, _url, _weight, _bonus in config.CONTESTS:
+        df = dfs[contest_name]
+        live = live_mask(df)
+        unofficial = (
+            as_bool_series(df["Unofficial"])
+            if "Unofficial" in df.columns
+            else pd.Series(False, index=df.index)
+        )
+
+        rows = {}
+        for handle, solved, is_live, is_unofficial in zip(
+            df["Handle"], df["Total_Solved"], live, unofficial
+        ):
+            key = handle_key(handle)
+            if not key:
+                continue
+
+            display_handles.setdefault(key, parse_handle(handle).handle)
+            rows[key] = (int(solved), bool(is_live))
+            if is_unofficial:
+                unofficial_keys.add(key)
+
+        contest_rows[contest_name] = rows
 
     combined_data = []
 
-    for handle in sorted(all_handles):
-        row = {"Handle": handle, "Unofficial": handle in unofficial_handles}
+    for key in display_handles:
+        row = {"Handle": display_handles[key], "Unofficial": key in unofficial_keys}
         weighted_total = 0.0
         total_solved = 0
+        total_bonus = 0.0
 
-        for contest_name, _url, weight in config.CONTESTS:
-            df = dfs[contest_name]
-            match = df[df["Handle"] == handle]
-
-            solved = int(match.iloc[0]["Total_Solved"]) if not match.empty else 0
+        for contest_name, _url, weight, bonus in config.CONTESTS:
+            solved, is_live = contest_rows[contest_name].get(key, (0, False))
+            applied_bonus = bonus if (bonus and is_live) else 0.0
 
             row[f"{contest_name}_Solved"] = solved
             row[f"{contest_name}_Weight"] = weight
             row[f"{contest_name}_Weighted"] = solved * weight
+            row[f"{contest_name}_Live"] = is_live
+            row[f"{contest_name}_Bonus"] = applied_bonus
 
             total_solved += solved
-            weighted_total += solved * weight
+            total_bonus += applied_bonus
+            weighted_total += solved * weight + applied_bonus
 
         row["Total_Solved_All_Contests"] = total_solved
+        row["Total_Bonus"] = total_bonus
         row["Weighted_Total"] = weighted_total
 
         for sheet_name in config.SHEET_NAMES:
@@ -178,7 +211,8 @@ def print_summary():
     for contest_config in config.CONTESTS:
         name = contest_config[0]
         weight = contest_config[2]
-        logger.info(f"  - {name} (weight: {weight})")
+        bonus = contest_config[3]
+        logger.info(f"  - {name} (weight: {weight}, participation bonus: {bonus})")
 
     logger.info("\nSheet thresholds:")
     for sheet_name in config.SHEET_NAMES:

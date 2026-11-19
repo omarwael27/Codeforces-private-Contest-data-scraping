@@ -1,6 +1,5 @@
 import time
 import random
-import re
 import pandas as pd
 from typing import List, Dict, Set, Tuple, Optional
 from selenium.webdriver.common.by import By
@@ -8,6 +7,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 from scraper.driver import DriverManager
+from utils.handles import clean_handle, parse_handle
 from utils.logger import logger
 import config
 
@@ -18,31 +18,13 @@ class CodeforcesScraperError(Exception):
     pass
 
 
-def clean_handle(raw_handle: str) -> Tuple[str, bool]:
-    """
-    Normalize a handle cell and detect unofficial/practice participants.
-
-    Codeforces renders practice-mode rows as "handle  →to practice" and
-    out-of-competition rows with a "*". Both should map to the bare handle,
-    with the row flagged as unofficial.
-
-    Returns:
-        (clean_handle, is_unofficial)
-    """
-    raw = (raw_handle or "").strip()
-    lowered = raw.lower()
-    is_unofficial = "*" in raw or "→" in raw or "to practice" in lowered
-
-    cleaned = raw.replace("*", "").strip()
-    cleaned = re.split(r"[\s→]+", cleaned)[0] if cleaned else ""
-    return cleaned, is_unofficial
-
-
 class CodeforcesScraper:
 
     def __init__(self):
         self.participants: Dict[str, Set[str]] = {}
+        self.display_handles: Dict[str, str] = {}
         self.unofficial: Set[str] = set()
+        self.live: Set[str] = set()
 
     def extract_page_data(self, driver: DriverManager) -> List[Dict[str, any]]:
         """
@@ -75,8 +57,8 @@ class CodeforcesScraper:
                     if len(cells) < 5:
                         continue
 
-                    handle, is_unofficial = clean_handle(cells[1].text)
-                    if not handle:
+                    info = parse_handle(cells[1].text)
+                    if not info.handle:
                         continue
 
                     solved = []
@@ -90,9 +72,10 @@ class CodeforcesScraper:
 
                     data.append(
                         {
-                            "Handle": handle,
+                            "Handle": info.handle,
                             "Solved": solved,
-                            "Unofficial": is_unofficial,
+                            "Unofficial": info.unofficial,
+                            "Live": info.live,
                         }
                     )
 
@@ -123,6 +106,10 @@ class CodeforcesScraper:
         try:
             page_url = url if page_num == 1 else f"{url}/page/{page_num}"
 
+            if config.INCLUDE_UNOFFICIAL:
+                separator = "&" if "?" in page_url else "?"
+                page_url = f"{page_url}{separator}showUnofficial=true"
+
             logger.info(f"[PAGE {page_num}] Loading...")
             driver.driver.get(page_url)
 
@@ -149,9 +136,7 @@ class CodeforcesScraper:
                     "then run `python main.py` again."
                 )
 
-            if config.INCLUDE_UNOFFICIAL:
-                driver.click_unofficial_checkbox()
-            else:
+            if not config.INCLUDE_UNOFFICIAL:
                 logger.info(
                     "Skipping unofficial participants (INCLUDE_UNOFFICIAL=False)"
                 )
@@ -195,7 +180,9 @@ class CodeforcesScraper:
         logger.info("=" * 60)
 
         self.participants = {}
+        self.display_handles = {}
         self.unofficial = set()
+        self.live = set()
         page = 1
 
         while page <= config.MAX_PAGES:
@@ -209,24 +196,31 @@ class CodeforcesScraper:
             any_new_data = False
 
             for entry in page_data:
-                handle = entry["Handle"]
+                info = parse_handle(entry["Handle"])
+                key = info.handle.casefold()
+                if not key:
+                    continue
+
+                self.display_handles.setdefault(key, info.handle)
                 solved = set(entry["Solved"])
 
                 if entry.get("Unofficial"):
-                    self.unofficial.add(handle)
+                    self.unofficial.add(key)
+                if entry.get("Live"):
+                    self.live.add(key)
 
-                if handle in self.participants:
-                    old_solved = self.participants[handle]
+                if key in self.participants:
+                    old_solved = self.participants[key]
                     new_solved = old_solved.union(solved)
 
                     # Check if there are any new problems solved
                     if len(new_solved) > len(old_solved):
-                        self.participants[handle] = new_solved
+                        self.participants[key] = new_solved
                         any_new_data = True
                     else:
-                        self.participants[handle] = new_solved
+                        self.participants[key] = new_solved
                 else:
-                    self.participants[handle] = solved
+                    self.participants[key] = solved
                     new_count += 1
                     any_new_data = True
 
@@ -250,12 +244,13 @@ class CodeforcesScraper:
         df = pd.DataFrame(
             [
                 {
-                    "Handle": handle,
+                    "Handle": self.display_handles[key],
                     "Solved_Problems": ",".join(sorted(problems)),
                     "Total_Solved": len(problems),
-                    "Unofficial": handle in self.unofficial,
+                    "Unofficial": key in self.unofficial,
+                    "Live": key in self.live,
                 }
-                for handle, problems in self.participants.items()
+                for key, problems in self.participants.items()
             ]
         )
 
@@ -288,7 +283,7 @@ class CodeforcesScraper:
         scraper = CodeforcesScraper()
 
         with DriverManager() as driver:
-            for contest_name, contest_url, _weight in config.CONTESTS:
+            for contest_name, contest_url, _weight, _bonus in config.CONTESTS:
                 df, csv_file = scraper.scrape_contest(
                     contest_name, contest_url, driver
                 )

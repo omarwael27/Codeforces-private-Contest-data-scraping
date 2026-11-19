@@ -51,6 +51,8 @@ This tool is designed specifically for **private Codeforces contests** (group co
 
 - Tracks performance across any number of contests
 - Per-contest weight: solving `m` problems is worth `m * weight`
+- Optional per-contest participation bonus for official participants in the
+  live standings (out-of-competition/virtual/practice excluded)
 - Weighted score compared against a threshold per sheet/day
 - Comprehensive scoring system
 
@@ -59,6 +61,8 @@ This tool is designed specifically for **private Codeforces contests** (group co
 - OAuth 2.0 authentication
 - Accepts a full Google Sheet link (or bare spreadsheet ID)
 - Writes `Yes`/`No` in column D based on the weighted score
+- Writes the numeric score in column E for easy mentor review
+- Case-insensitive handle matching (sheet handles can differ in casing)
 - Never deletes participant rows
 - Professional cell formatting
 - Multi-sheet support with per-day thresholds
@@ -125,9 +129,9 @@ CREDENTIALS_FILE=credentials.json
 SHEET_THRESHOLDS=Sat 4 -> 8=8;Sun 10 -> 2=10;Sun 4 -> 8=8;Mon 4 -> 8=8
 GLOBAL_THRESHOLD=8
 
-# Contests: name|standings_url|weight
+# Contests: name|standings_url|weight|participation_bonus
 CONTEST_COUNT=2
-CONTESTS=Contest1|https://.../standings|1;Contest2|https://.../standings|2
+CONTESTS=Contest1|https://.../standings|1|0;Contest2|https://.../standings|2|2
 
 # Scraper Settings
 RUN_SCRAPER=True
@@ -143,7 +147,8 @@ COMBINED_CSV=combined_results.csv
 
 ```env
 # Solving m problems in a contest gives m * weight points.
-CONTESTS=Contest1|https://.../standings|1;Contest2|https://.../standings|2
+# The 4th field is an optional participation bonus (0 if omitted).
+CONTESTS=Contest1|https://.../standings|1|0;Contest2|https://.../standings|2|2
 ```
 
 7. **Log in to Codeforces once**
@@ -186,6 +191,7 @@ Codeforces-private-Contest-data-scraping/
 │   └── operations.py
 └── utils/
     ├── __init__.py
+    ├── handles.py
     └── logger.py
 ```
 
@@ -202,27 +208,28 @@ Codeforces-private-Contest-data-scraping/
   - `operations.py` - Sheet operations (CRUD)
 
 - `utils/` - Utility modules
+  - `handles.py` - Handle normalization and live/unofficial classification
   - `logger.py` - Logging configuration
 
 ---
 
 ## Workflow
 
-The system operates in three main phases:
+The system operates in four main phases:
 
 **Scraping Phase**: Retrieves standings from all configured Codeforces contests
 
 **Scoring Phase**: Multiplies each contest's solved count by its weight, then sums the weighted scores
 
-**Google Sheets Update**: Writes `Yes`/`No` in column D for each participant and each sheet/day threshold
+**Google Sheets Update**: Writes `Yes`/`No` in column D and the numeric score in column E for each participant and each sheet/day threshold
 
-**Report Generation**: Creates combined analytics CSV with weighted aggregate results
+**Report Generation**: Creates combined analytics CSV with weighted aggregate results, participation bonuses, and live-standings flags
 
 ### Output Files
 
 - `Contest1_standings.csv` - Individual contest results
 - `Contest2_standings.csv` - Individual contest results
-- `combined_results.csv` - Aggregated results with per-contest weighted scores and weighted totals
+- `combined_results.csv` - Aggregated results with per-contest weighted scores, live flags, participation bonuses, and weighted totals
 - `acm_tracker.log` - Detailed execution log
 
 ---
@@ -239,7 +246,7 @@ The system operates in three main phases:
 | `SHEET_THRESHOLDS`  | Semicolon-separated `sheet=threshold` pairs                       | -        |
 | `GLOBAL_THRESHOLD`  | Fallback threshold for sheets without their own value             | 8        |
 | `CONTEST_COUNT`     | Number of contests (must match the `CONTESTS` entries)            | -        |
-| `CONTESTS`          | Semicolon-separated `name\|standings_url\|weight` entries         | -        |
+| `CONTESTS`          | Semicolon-separated `name\|standings_url\|weight\|bonus` entries  | -        |
 | `RUN_SCRAPER`       | Run scraper or load existing CSVs                                 | True     |
 | `INCLUDE_UNOFFICIAL`| Count unofficial/practice-mode participants                       | True     |
 | `CHROME_VERSION`    | Force ChromeDriver major version (auto-detected if unset)         | -        |
@@ -249,9 +256,14 @@ The system operates in three main phases:
 ### Contest Configuration (`.env`)
 
 ```env
-# name|standings_url|weight
-CONTESTS=Contest1|https://.../standings|1;Contest2|https://.../standings|2
+# name|standings_url|weight|participation_bonus
+CONTESTS=Contest1|https://.../standings|1|0;Contest2|https://.../standings|2|2
 ```
+
+The 4th field is optional (defaults to `0`). Its bonus is added once to every
+official participant who appeared in that contest's **live** standings.
+Out-of-competition (`*`), virtual (`#`), and practice (`→to practice`)
+participants do not receive it.
 
 If `CONTESTS` is not set, the values in `config.py` are used.
 
@@ -261,11 +273,15 @@ The weighted score for a participant is:
 
 ```
 score = sum(solved_in_contest_i * weight_i)
+      + sum(participation_bonus_i if participant_was_live_in_contest_i)
 ```
 
 A participant is valid to a given sheet/day when `score >= threshold` for that
-sheet. The app writes `Yes` in column D when valid and `No` otherwise. Rows are
-never deleted, and each sheet can have a different threshold.
+sheet. The app writes `Yes` in column D when valid and `No` otherwise, and the
+numeric score in column E. Rows are never deleted, and each sheet can have a
+different threshold. Handles are matched case-insensitively, and artifacts such
+as a trailing `#`, a virtual start time, or `→to practice` are stripped before
+matching.
 
 ---
 

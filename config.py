@@ -59,26 +59,33 @@ COMBINED_CSV: str = os.getenv("COMBINED_CSV", "combined_results.csv")
 CONTEST_COUNT: int = int(os.getenv("CONTEST_COUNT", "0") or 0)
 
 # Contest Configuration
-# Format: (contest_name, contest_standings_url, weight)
+# Format: (contest_name, contest_standings_url, weight, participation_bonus)
 # Example in .env:
-#   CONTESTS=Contest1|https://.../standings|1;Contest2|https://.../standings|2
-DEFAULT_CONTESTS: List[Tuple[str, str, float]] = [
+#   CONTESTS=Contest1|https://.../standings|1|0;Contest2|https://.../standings|2|3
+# The participation bonus is awarded to official participants who appeared in
+# the live standings, but not out-of-competition/virtual/practice participants.
+DEFAULT_CONTESTS: List[Tuple[str, str, float, float]] = [
     (
         "Contest1",
         "https://codeforces.com/group/3MTZPM7hsC/contest/651191/standings",
         1.0,
+        0.0,
     ),
     (
         "Contest2",
         "https://codeforces.com/group/3MTZPM7hsC/contest/652764/standings",
         1.0,
+        0.0,
     ),
 ]
 
 
-def _parse_contests(raw: str) -> List[Tuple[str, str, float]]:
-    """Parse contests from a ';' separated list of name|url|weight entries."""
-    contests: List[Tuple[str, str, float]] = []
+def _parse_contests(raw: str) -> List[Tuple[str, str, float, float]]:
+    """
+    Parse contests from a ';' separated list of
+    name|url|weight|participation_bonus entries.
+    """
+    contests: List[Tuple[str, str, float, float]] = []
 
     for index, chunk in enumerate(raw.split(";"), start=1):
         chunk = chunk.strip()
@@ -92,12 +99,13 @@ def _parse_contests(raw: str) -> List[Tuple[str, str, float]]:
         name = parts[0] or f"Contest{index}"
         url = parts[1]
         weight = float(parts[2]) if len(parts) > 2 and parts[2] else 1.0
-        contests.append((name, url, weight))
+        bonus = float(parts[3]) if len(parts) > 3 and parts[3] else 0.0
+        contests.append((name, url, weight, bonus))
 
     return contests
 
 
-CONTESTS: List[Tuple[str, str, float]] = (
+CONTESTS: List[Tuple[str, str, float, float]] = (
     _parse_contests(os.getenv("CONTESTS", "")) or DEFAULT_CONTESTS
 )
 
@@ -174,12 +182,15 @@ def validate_config() -> bool:
         )
         return False
 
-    for name, url, weight in CONTESTS:
+    for name, url, weight, bonus in CONTESTS:
         if not name or not url:
             print("❌ ERROR: Every contest needs a name and a standings link")
             return False
         if weight <= 0:
             print(f"❌ ERROR: Contest '{name}' has a non-positive weight")
+            return False
+        if bonus < 0:
+            print(f"❌ ERROR: Contest '{name}' has a negative participation bonus")
             return False
 
     if not SHEET_NAMES:
