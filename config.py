@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -144,6 +144,58 @@ SHEET_THRESHOLDS: Dict[str, float] = _parse_sheet_thresholds(
     os.getenv("SHEET_THRESHOLDS", ""), SHEET_NAMES, GLOBAL_THRESHOLD
 )
 
+
+def _parse_subset_thresholds(raw: str) -> Dict[str, float]:
+    """
+    Parse semicolon-separated 'name_prefix=threshold' pairs for subset rules.
+
+    Example:
+        SUBSET_THRESHOLDS=Week 3=21
+    A participant must also score at least the threshold across every contest
+    whose name starts with the given prefix.
+    """
+    subset_thresholds: Dict[str, float] = {}
+
+    for chunk in raw.split(";"):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+
+        name, value = chunk.rsplit("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name or not value:
+            continue
+
+        subset_thresholds[name] = float(value)
+
+    return subset_thresholds
+
+
+# Subset (local) thresholds over groups of contests, e.g.:
+#   SUBSET_THRESHOLDS=Week 3=21
+# Validity then requires the global/sheet threshold AND every subset threshold.
+SUBSET_THRESHOLDS: Dict[str, float] = _parse_subset_thresholds(
+    os.getenv("SUBSET_THRESHOLDS", "")
+)
+
+
+def get_subset_contests(
+    name_prefix: str,
+    contests: Optional[List[Tuple[str, str, float, float]]] = None,
+) -> List[Tuple[str, str, float, float]]:
+    """Return contests whose name starts with the given prefix (case-insensitive)."""
+    if contests is None:
+        contests = CONTESTS
+
+    prefix = name_prefix.strip().casefold()
+    return [
+        contest
+        for contest in contests
+        if contest[0].strip().casefold().startswith(prefix)
+    ]
+
+
 # Scraper Delays (in seconds)
 MIN_PAGE_DELAY: float = 1.0
 MAX_PAGE_DELAY: float = 2.0
@@ -196,5 +248,15 @@ def validate_config() -> bool:
     if not SHEET_NAMES:
         print("❌ ERROR: SHEET_NAMES not set in .env file")
         return False
+
+    for name, threshold in SUBSET_THRESHOLDS.items():
+        if threshold < 0:
+            print(f"❌ ERROR: SUBSET_THRESHOLDS '{name}' is negative")
+            return False
+        if not get_subset_contests(name):
+            print(
+                f"❌ ERROR: SUBSET_THRESHOLDS prefix '{name}' matches no contest"
+            )
+            return False
 
     return True

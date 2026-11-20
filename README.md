@@ -129,6 +129,9 @@ CREDENTIALS_FILE=credentials.json
 SHEET_THRESHOLDS=Sat 4 -> 8=8;Sun 10 -> 2=10;Sun 4 -> 8=8;Mon 4 -> 8=8
 GLOBAL_THRESHOLD=8
 
+# Optional subset thresholds (contest-name-prefix=threshold pairs)
+SUBSET_THRESHOLDS=Week 3=21
+
 # Contests: name|standings_url|weight|participation_bonus
 CONTEST_COUNT=2
 CONTESTS=Contest1|https://.../standings|1|0;Contest2|https://.../standings|2|2
@@ -245,6 +248,7 @@ The system operates in four main phases:
 | `SHEET_NAMES`       | Comma-separated sheet/tab names                                   | Required |
 | `SHEET_THRESHOLDS`  | Semicolon-separated `sheet=threshold` pairs                       | -        |
 | `GLOBAL_THRESHOLD`  | Fallback threshold for sheets without their own value             | 8        |
+| `SUBSET_THRESHOLDS` | Semicolon-separated `contest_name_prefix=threshold` pairs (extra rule over groups of contests) | - |
 | `CONTEST_COUNT`     | Number of contests (must match the `CONTESTS` entries)            | -        |
 | `CONTESTS`          | Semicolon-separated `name\|standings_url\|weight\|bonus` entries  | -        |
 | `RUN_SCRAPER`       | Run scraper or load existing CSVs                                 | True     |
@@ -282,6 +286,20 @@ numeric score in column E. Rows are never deleted, and each sheet can have a
 different threshold. Handles are matched case-insensitively, and artifacts such
 as a trailing `#`, a virtual start time, or `→to practice` are stripped before
 matching.
+
+### Subset Thresholds (optional)
+
+`SUBSET_THRESHOLDS` adds extra rules over groups of contests identified by
+their name prefix:
+
+```env
+SUBSET_THRESHOLDS=Week 3=21
+```
+
+A participant is only marked `Yes` when the sheet threshold **and** every
+subset threshold are met. In the example above, the weighted sum of all
+contests whose name starts with `Week 3` must be `>= 21` in addition to the
+sheet/global threshold. Multiple rules can be combined with `;`.
 
 ---
 

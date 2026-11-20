@@ -92,6 +92,65 @@ def build_weighted_scores(
     return scores
 
 
+def build_subset_scores(
+    contest_configs: List[Tuple[str, str, float, float]],
+    dfs: Dict[str, pd.DataFrame],
+    name_prefixes: List[str],
+) -> Dict[str, Dict[str, float]]:
+    """
+    Precompute weighted sums per subset of contests.
+
+    A subset is defined by a contest-name prefix (e.g. "Week 3" matches
+    "Week 3 : practice", "Week 3 : solve together", "Week 3 : sheet").
+
+    Returns {prefix: {case-insensitive handle: subset score}}.
+    """
+    subset_scores: Dict[str, Dict[str, float]] = {
+        prefix: {} for prefix in name_prefixes
+    }
+
+    for prefix in name_prefixes:
+        matching = config.get_subset_contests(prefix, contest_configs)
+        if not matching:
+            logger.warning(
+                f"  ⚠️  Subset '{prefix}' matches no contest; "
+                "treating its score as 0"
+            )
+
+        for contest_name, _url, weight, bonus in matching:
+            df = dfs[contest_name]
+            live = live_mask(df)
+
+            for handle, solved, is_live in zip(
+                df["Handle"], df["Total_Solved"], live
+            ):
+                key = handle_key(handle)
+                if not key:
+                    continue
+
+                current = subset_scores[prefix].get(key, 0.0)
+                subset_scores[prefix][key] = (
+                    current + int(solved) * weight
+                )
+                if bonus and bool(is_live):
+                    subset_scores[prefix][key] += bonus
+
+    return subset_scores
+
+
+def meets_subset_thresholds(
+    key: str,
+    subset_scores: Dict[str, Dict[str, float]],
+    subset_thresholds: Dict[str, float],
+) -> bool:
+    """Return True when the handle meets every configured subset threshold."""
+    for prefix, threshold in subset_thresholds.items():
+        score = subset_scores.get(prefix, {}).get(key, 0.0)
+        if score < threshold:
+            return False
+    return True
+
+
 class SheetsOperations:
 
     def __init__(self):
@@ -375,8 +434,9 @@ def clean_google_sheets(dfs: Dict[str, pd.DataFrame]) -> None:
     Mark participants in columns D (verdict) and E (score) of every sheet.
 
     A participant is valid for a sheet when their weighted score across all
-    contests is greater than or equal to that sheet's threshold. Rows are
-    never deleted.
+    contests is greater than or equal to that sheet's threshold AND every
+    configured subset threshold is met (e.g. the sum of all "Week 3"
+    contests). Rows are never deleted.
     """
     logger.info("\n" + "=" * 60)
     logger.info("STEP 2: MARKING PARTICIPANTS IN GOOGLE SHEETS")
@@ -388,7 +448,17 @@ def clean_google_sheets(dfs: Dict[str, pd.DataFrame]) -> None:
     logger.info("✅ Authenticated\n")
 
     scores = build_weighted_scores(config.CONTESTS, dfs)
+    subset_scores = build_subset_scores(
+        config.CONTESTS, dfs, list(config.SUBSET_THRESHOLDS)
+    )
     total_marked = 0
+
+    if config.SUBSET_THRESHOLDS:
+        for prefix, sub_threshold in config.SUBSET_THRESHOLDS.items():
+            logger.info(
+                f"Subset rule: contests starting with '{prefix}' "
+                f"must sum to >= {sub_threshold:g}"
+            )
 
     # Data starts at row 3 (index 2): row 1 is the header, row 2 is a section row.
     for sheet_name in config.SHEET_NAMES:
@@ -436,7 +506,9 @@ def clean_google_sheets(dfs: Dict[str, pd.DataFrame]) -> None:
                 continue
 
             score = scores.get(key, 0.0)
-            is_valid = score >= threshold
+            is_valid = score >= threshold and meets_subset_thresholds(
+                key, subset_scores, config.SUBSET_THRESHOLDS
+            )
             status = "Yes" if is_valid else "No"
             score_value = (
                 int(score) if float(score).is_integer() else round(float(score), 2)

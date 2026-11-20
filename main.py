@@ -4,7 +4,11 @@ import pandas as pd
 from typing import Dict, Tuple
 import config
 from scraper.codeforces import CodeforcesScraper
-from sheets.operations import clean_google_sheets
+from sheets.operations import (
+    build_subset_scores,
+    clean_google_sheets,
+    meets_subset_thresholds,
+)
 from utils.handles import as_bool_series, handle_key, live_mask, parse_handle
 from utils.logger import logger
 
@@ -154,6 +158,10 @@ def generate_combined_csv(dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 
     combined_data = []
 
+    subset_scores = build_subset_scores(
+        config.CONTESTS, dfs, list(config.SUBSET_THRESHOLDS)
+    )
+
     for key in display_handles:
         row = {"Handle": display_handles[key], "Unofficial": key in unofficial_keys}
         weighted_total = 0.0
@@ -178,11 +186,17 @@ def generate_combined_csv(dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         row["Total_Bonus"] = total_bonus
         row["Weighted_Total"] = weighted_total
 
+        for prefix in config.SUBSET_THRESHOLDS:
+            row[f"Subset_{prefix}_Total"] = subset_scores.get(prefix, {}).get(
+                key, 0.0
+            )
+
         for sheet_name in config.SHEET_NAMES:
             threshold = config.get_sheet_threshold(sheet_name)
-            row[f"Valid_{sheet_name}"] = (
-                "Yes" if weighted_total >= threshold else "No"
+            is_valid = weighted_total >= threshold and meets_subset_thresholds(
+                key, subset_scores, config.SUBSET_THRESHOLDS
             )
+            row[f"Valid_{sheet_name}"] = "Yes" if is_valid else "No"
 
         combined_data.append(row)
 
@@ -219,6 +233,13 @@ def print_summary():
         logger.info(
             f"  - {sheet_name}: {config.get_sheet_threshold(sheet_name)}"
         )
+
+    if config.SUBSET_THRESHOLDS:
+        logger.info("\nSubset thresholds (in addition to sheet thresholds):")
+        for prefix, threshold in config.SUBSET_THRESHOLDS.items():
+            logger.info(
+                f"  - contests starting with '{prefix}': >= {threshold:g}"
+            )
 
     logger.info("=" * 60 + "\n")
 
